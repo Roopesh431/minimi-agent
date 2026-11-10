@@ -5,6 +5,7 @@ export interface SearchResult {
   title: string;
   url: string;
   snippet: string;
+  date?: string;
 }
 
 interface TinyFishResponse {
@@ -39,8 +40,6 @@ export class SearchProviderError extends Error {
   }
 }
 
-// Domains that are usually poor primary sources for news searches.
-// They are not blocked for ordinary searches.
 const NEWS_EXCLUDED_DOMAINS = [
   "youtube.com",
   "youtu.be",
@@ -68,8 +67,6 @@ function normalizeUrl(rawUrl: string): string | null {
       return null;
     }
 
-    // Remove tracking parameters so the same article
-    // is not returned multiple times.
     const trackingParams = [
       "utm_source",
       "utm_medium",
@@ -156,18 +153,21 @@ function cleanResults(
     .map((item, index) => {
       const normalizedUrl = normalizeUrl(item.url)!;
 
-      let siteName = item.site_name;
-
-      if (!siteName) {
-        siteName = new URL(normalizedUrl).hostname;
-      }
-
       return {
         position: index + 1,
-        site_name: siteName,
+        site_name:
+          typeof item.site_name === "string" && item.site_name.trim()
+            ? item.site_name.trim()
+            : new URL(normalizedUrl).hostname,
         title: item.title.trim(),
         url: normalizedUrl,
-        snippet: item.snippet.trim()
+        snippet: item.snippet.trim(),
+
+        // Preserve TinyFish publication/freshness metadata.
+        // This may be relative text such as "11 hours ago".
+        ...(typeof item.date === "string" && item.date.trim()
+          ? { date: item.date.trim() }
+          : {})
       };
     });
 }
@@ -200,10 +200,7 @@ export async function searchWeb(
   });
 
   if (options.recencyMinutes !== undefined) {
-    params.set(
-      "recency_minutes",
-      String(options.recencyMinutes)
-    );
+    params.set("recency_minutes", String(options.recencyMinutes));
   }
 
   if (options.page !== undefined) {
@@ -285,6 +282,7 @@ export async function searchWeb(
   return {
     query,
     results,
+    // This is the provider's total, before local filtering.
     totalResults: Number(data.total_results) || results.length,
     page: Number(data.page) || options.page || 0
   };
