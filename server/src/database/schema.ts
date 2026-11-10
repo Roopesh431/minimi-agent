@@ -90,4 +90,56 @@ export function initializeSchema(db: Database.Database) {
   }
 
   console.log("Database schema initialized successfully");
+
+
+  // Structured memory facts with source provenance
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_facts (
+      id TEXT PRIMARY KEY,
+
+      conversation_id TEXT NOT NULL,
+      source_message_id TEXT NOT NULL,
+
+      fact_type TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      predicate TEXT NOT NULL,
+      object TEXT NOT NULL DEFAULT '',
+
+      confidence REAL NOT NULL DEFAULT 1.0
+        CHECK (confidence >= 0 AND confidence <= 1),
+
+      extraction_method TEXT NOT NULL DEFAULT 'rule-based',
+
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+      FOREIGN KEY (conversation_id)
+        REFERENCES conversations(id)
+        ON DELETE CASCADE,
+
+      FOREIGN KEY (source_message_id)
+        REFERENCES messages(id)
+        ON DELETE CASCADE,
+
+      UNIQUE (
+        source_message_id,
+        fact_type,
+        subject,
+        predicate,
+        object
+      )
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_memory_facts_subject
+    ON memory_facts(subject);
+
+    CREATE INDEX IF NOT EXISTS idx_memory_facts_type
+    ON memory_facts(fact_type);
+
+    CREATE INDEX IF NOT EXISTS idx_memory_facts_conversation
+    ON memory_facts(conversation_id);
+
+    CREATE INDEX IF NOT EXISTS idx_memory_facts_source
+    ON memory_facts(source_message_id);
+  `);
+
 }

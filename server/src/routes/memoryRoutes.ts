@@ -3,6 +3,8 @@ import { Router } from "express";
 import { z } from "zod";
 import { searchMessages } from "../memory/retrieval";
 import { getConversationTimeline } from "../memory/timeline";
+import { extractConversationFacts } from "../memory/extraction";
+import db from "../database/database";
 
 const router = Router();
 
@@ -92,3 +94,109 @@ router.get("/search", (req, res) => {
 });
 
 export default router;
+
+
+// Extract structured facts from a conversation
+router.post("/:conversationId/extract", (req, res) => {
+  const conversationId = req.params.conversationId;
+
+  const conversation = db.prepare(`
+    SELECT id FROM conversations WHERE id = ?
+  `).get(conversationId);
+
+  if (!conversation) {
+    return res.status(404).json({
+      success: false,
+      error: "Conversation not found"
+    });
+  }
+
+  try {
+    const result = extractConversationFacts(conversationId);
+
+    return res.json({
+      success: true,
+      message: "Memory extraction completed",
+      data: result
+    });
+  } catch (error) {
+    console.error("Memory extraction failed:", error);
+
+    return res.status(500).json({
+      success: false,
+      error: "Unable to extract conversation facts"
+    });
+  }
+});
+
+// Retrieve structured facts
+router.get("/facts", (req, res) => {
+  const validation = z.object({
+    q: z.string().trim().max(200).optional(),
+    type: z.enum(["shortlist", "decision"]).optional(),
+    conversationId: z.string().uuid().optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(20)
+  }).safeParse(req.query);
+
+  if (!validation.success) {
+    return res.status(400).json({
+      success: false,
+      error: validation.error.flatten()
+    });
+  }
+
+  const { q, type, conversationId, limit } = validation.data;
+
+  const conditions: string[] = [];
+  const params: (string | number)[] = [];
+
+  if (q) {
+    conditions.push(
+      "(f.subject LIKE ? OR f.object LIKE ?)"
+    );
+
+    params.push(`%${q}%`, `%${q}%`);
+  }
+
+  if (type) {
+    conditions.push("f.fact_type = ?");
+    params.push(type);
+  }
+
+  if (conversationId) {
+    conditions.push("f.conversation_id = ?");
+    params.push(conversationId);
+  }
+
+  const whereClause = conditions.length
+    ? `WHERE ${conditions.join(" AND ")}`
+    : "";
+
+  const facts = db.prepare(`
+    SELECT
+      f.*,
+      m.content AS source_content,
+      m.created_at AS observed_at,
+      c.title AS conversation_title
+
+    FROM memory_facts f
+
+    JOIN messages m
+      ON m.id = f.source_message_id
+
+    JOIN conversations c
+      ON c.id = f.conversation_id
+
+    ${whereClause}
+
+    ORDER BY m.created_at DESC
+
+    LIMIT ?
+  `).all(...params, limit);
+
+  return res.json({
+    success: true,
+    count: facts.length,
+    data: facts
+  });
+});
