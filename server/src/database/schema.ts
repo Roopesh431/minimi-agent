@@ -142,4 +142,48 @@ export function initializeSchema(db: Database.Database) {
     ON memory_facts(source_message_id);
   `);
 
+
+  // Backward-compatible memory fact migration
+  const factColumns = db.prepare(`
+    PRAGMA table_info(memory_facts)
+  `).all() as { name: string }[];
+
+  const existingColumns = new Set(
+    factColumns.map(column => column.name)
+  );
+
+  if (!existingColumns.has("status")) {
+    db.exec(`
+      ALTER TABLE memory_facts
+      ADD COLUMN status TEXT NOT NULL DEFAULT 'current'
+      CHECK (status IN ('current', 'superseded'));
+    `);
+  }
+
+  if (!existingColumns.has("superseded_by_fact_id")) {
+    db.exec(`
+      ALTER TABLE memory_facts
+      ADD COLUMN superseded_by_fact_id TEXT;
+    `);
+  }
+
+  if (!existingColumns.has("superseded_at")) {
+    db.exec(`
+      ALTER TABLE memory_facts
+      ADD COLUMN superseded_at TEXT;
+    `);
+  }
+
+  if (!existingColumns.has("supersession_reason")) {
+    db.exec(`
+      ALTER TABLE memory_facts
+      ADD COLUMN supersession_reason TEXT;
+    `);
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_memory_facts_status
+    ON memory_facts(status);
+  `);
+
 }
