@@ -5,8 +5,9 @@ import cors from "cors";
 import conversationRoutes from "./routes/conversationRoutes";
 import memoryRoutes from "./routes/memoryRoutes";
 import searchRoutes from "./routes/searchRoutes";
+import agentRoutes from "./routes/agentRoutes";
 
-// Always load the server's own .env file.
+// Load server environment variables.
 dotenv.config({
   path: new URL("../.env", import.meta.url)
 });
@@ -28,6 +29,7 @@ app.get("/api/health", (_req, res) => {
 app.use("/api/conversations", conversationRoutes);
 app.use("/api/memory", memoryRoutes);
 app.use("/api/search", searchRoutes);
+app.use("/api/agent", agentRoutes);
 
 app.listen(PORT, () => {
   console.log(`Minimi API running at http://localhost:${PORT}`);

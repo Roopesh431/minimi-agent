@@ -39,6 +39,139 @@ export class SearchProviderError extends Error {
   }
 }
 
+// Domains that are usually poor primary sources for news searches.
+// They are not blocked for ordinary searches.
+const NEWS_EXCLUDED_DOMAINS = [
+  "youtube.com",
+  "youtu.be",
+  "instagram.com",
+  "facebook.com",
+  "tiktok.com",
+  "pinterest.com",
+  "linkedin.com",
+  "reddit.com",
+  "x.com",
+  "twitter.com"
+];
+
+function isNewsQuery(query: string): boolean {
+  return /\b(news|latest|recent|today|yesterday|developments?|announcements?|launched|launches|released|release|breaking|last\s+\d+\s+(hours?|days?)|past\s+\d+\s+(hours?|days?)|last\s+24\s+hours|past\s+24\s+hours|this\s+week)\b/i.test(
+    query
+  );
+}
+
+function normalizeUrl(rawUrl: string): string | null {
+  try {
+    const url = new URL(rawUrl);
+
+    if (!["http:", "https:"].includes(url.protocol)) {
+      return null;
+    }
+
+    // Remove tracking parameters so the same article
+    // is not returned multiple times.
+    const trackingParams = [
+      "utm_source",
+      "utm_medium",
+      "utm_campaign",
+      "utm_term",
+      "utm_content",
+      "fbclid",
+      "gclid",
+      "ref",
+      "source"
+    ];
+
+    trackingParams.forEach((param) => {
+      url.searchParams.delete(param);
+    });
+
+    url.hash = "";
+    url.hostname = url.hostname.toLowerCase().replace(/^www\./, "");
+
+    if (url.pathname.length > 1) {
+      url.pathname = url.pathname.replace(/\/+$/, "");
+    }
+
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function isExcludedNewsDomain(url: string): boolean {
+  try {
+    const hostname = new URL(url).hostname
+      .toLowerCase()
+      .replace(/^www\./, "");
+
+    return NEWS_EXCLUDED_DOMAINS.some(
+      (domain) =>
+        hostname === domain || hostname.endsWith(`.${domain}`)
+    );
+  } catch {
+    return true;
+  }
+}
+
+function cleanResults(
+  rawResults: SearchResult[],
+  query: string
+): SearchResult[] {
+  const seenUrls = new Set<string>();
+  const newsSearch = isNewsQuery(query);
+
+  return rawResults
+    .filter((item) => {
+      if (
+        !item ||
+        typeof item.title !== "string" ||
+        typeof item.url !== "string" ||
+        typeof item.snippet !== "string"
+      ) {
+        return false;
+      }
+
+      if (!item.title.trim() || !item.snippet.trim()) {
+        return false;
+      }
+
+      const normalizedUrl = normalizeUrl(item.url);
+
+      if (!normalizedUrl) {
+        return false;
+      }
+
+      if (newsSearch && isExcludedNewsDomain(normalizedUrl)) {
+        return false;
+      }
+
+      if (seenUrls.has(normalizedUrl)) {
+        return false;
+      }
+
+      seenUrls.add(normalizedUrl);
+      return true;
+    })
+    .map((item, index) => {
+      const normalizedUrl = normalizeUrl(item.url)!;
+
+      let siteName = item.site_name;
+
+      if (!siteName) {
+        siteName = new URL(normalizedUrl).hostname;
+      }
+
+      return {
+        position: index + 1,
+        site_name: siteName,
+        title: item.title.trim(),
+        url: normalizedUrl,
+        snippet: item.snippet.trim()
+      };
+    });
+}
+
 export async function searchWeb(
   options: SearchOptions
 ): Promise<SearchResponse> {
@@ -51,14 +184,26 @@ export async function searchWeb(
     );
   }
 
+  const query = options.query.trim();
+
+  if (!query) {
+    throw new SearchProviderError(
+      "Search query cannot be empty.",
+      400
+    );
+  }
+
   const params = new URLSearchParams({
-    query: options.query,
+    query,
     location: options.location ?? "IN",
     language: options.language ?? "en"
   });
 
   if (options.recencyMinutes !== undefined) {
-    params.set("recency_minutes", String(options.recencyMinutes));
+    params.set(
+      "recency_minutes",
+      String(options.recencyMinutes)
+    );
   }
 
   if (options.page !== undefined) {
@@ -80,7 +225,10 @@ export async function searchWeb(
       }
     );
   } catch (error) {
-    if (error instanceof Error && error.name === "TimeoutError") {
+    if (
+      error instanceof Error &&
+      (error.name === "TimeoutError" || error.name === "AbortError")
+    ) {
       throw new SearchProviderError(
         "The search provider timed out. Please try again.",
         504
@@ -132,23 +280,10 @@ export async function searchWeb(
     );
   }
 
-  const results = data.results
-    .filter(
-      (item) =>
-        typeof item.title === "string" &&
-        typeof item.url === "string" &&
-        typeof item.snippet === "string"
-    )
-    .map((item) => ({
-      position: Number(item.position) || 0,
-      site_name: item.site_name ?? "",
-      title: item.title,
-      url: item.url,
-      snippet: item.snippet
-    }));
+  const results = cleanResults(data.results, query);
 
   return {
-    query: options.query,
+    query,
     results,
     totalResults: Number(data.total_results) || results.length,
     page: Number(data.page) || options.page || 0
