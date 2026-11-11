@@ -68,6 +68,7 @@ interface SearchSource {
   url: string;
   site_name: string;
   snippet: string;
+  date?: string;
 }
 
 interface TemporalConstraint {
@@ -78,20 +79,24 @@ interface TemporalConstraint {
 interface ClassifiedSource {
   source: SearchSource;
   ageMinutes: number | null;
+  ageSource: "provider_date" | "snippet_fallback" | "unavailable";
   isRecent: boolean;
   isFutureEvent: boolean;
   isEvergreen: boolean;
+  isRoundup: boolean;
   isDevelopmentSignal: boolean;
   eligibleDevelopment: boolean;
   reason: string;
 }
 
 export interface TemporalEvidence {
-  recentSnippetMatches: number;
-  developmentSignals: number;
+  recentProviderDateMatches: number;
+  recentSnippetFallbackMatches: number;
+  eligibleDevelopments: number;
   unverified: number;
   excludedFutureEvents: number;
   excludedEvergreen: number;
+  excludedRoundups: number;
 }
 
 function saveMessage(
@@ -554,7 +559,10 @@ function extractValidSources(
       site_name:
         result.site_name?.trim() ||
         new URL(normalizedUrl).hostname,
-      snippet: result.snippet.trim()
+      snippet: result.snippet.trim(),
+      ...(typeof result.date === "string" && result.date.trim()
+        ? { date: result.date.trim() }
+        : {})
     };
 
     const duplicateAnnouncement = sources.some(existing =>
@@ -577,25 +585,31 @@ function extractValidSources(
 // --------------------------------------------------
 
 function extractRelativeAgeMinutes(
-  snippet: string
+  text: string
 ): number | null {
-  const match = snippet.toLowerCase().match(
+  const normalized = text.toLowerCase();
+  const match = normalized.match(
     /\b(\d+)\s*(minutes?|mins?|hours?|hrs?|days?|weeks?)\s+ago\b/
   );
 
-  if (!match) return null;
+  if (match) {
+    const amount = Number(match[1]);
+    const unit = match[2];
 
-  const amount = Number(match[1]);
-  const unit = match[2];
-
-  if (unit.startsWith("min")) return amount;
-  if (unit.startsWith("hour") || unit.startsWith("hr")) {
-    return amount * 60;
+    if (unit.startsWith("min")) return amount;
+    if (unit.startsWith("hour") || unit.startsWith("hr")) {
+      return amount * 60;
+    }
+    if (unit.startsWith("day")) return amount * 1440;
+    if (unit.startsWith("week")) return amount * 10080;
   }
-  if (unit.startsWith("day")) return amount * 1440;
-  if (unit.startsWith("week")) return amount * 10080;
 
-  return null;
+  // Some providers return an absolute publication date instead
+  // of a relative age. Parse it only when it is a valid date.
+  const timestamp = Date.parse(text);
+  if (Number.isNaN(timestamp)) return null;
+
+  return Math.round((Date.now() - timestamp) / 60000);
 }
 
 function getIndiaDateParts(): {
@@ -691,9 +705,11 @@ function hasFutureEventLanguage(text: string): boolean {
 }
 
 function isEvergreenContent(title: string): boolean {
-  return /\b(best\s+\d+|top\s+\d+|best\s+.*frameworks?|top\s+.*frameworks?|frameworks?\s+list|directory|companies|company list|tutorial|beginner.?s guide|complete guide|ultimate guide|how to use|how to build|comparison of)\b/i.test(
-    title
-  );
+  return /\b(\d+\s+(?:best|top)|(?:best|top)\s+\d+|(?:best|top)\s+.*(?:tools?|platforms?|frameworks?|agents?|software|companies)|frameworks?\s+list|directory|companies|company\s+list|list\s+of|catalog(?:ue)?|tutorial|codelab|documentation|developer\s+guide|beginner.?s\s+guide|complete\s+guide|ultimate\s+guide|how[\s-]+to|comparison\s+of|getting\s+started|api\s+reference)\b/i.test(title);
+}
+
+function isRoundupContent(title: string): boolean {
+  return /\b(weekly|daily|monthly|roundup|round-up|digest|week\s+of|this\s+week|top\s+stories|news\s+today)\b/i.test(title);
 }
 
 function isDevelopmentSignal(text: string): boolean {
@@ -708,9 +724,22 @@ function classifyTemporalSource(
 ): ClassifiedSource {
   const combinedText = `${source.title}. ${source.snippet}`;
 
-  // The relative age is taken from the search snippet only.
-  // It is not treated as independently verified publication metadata.
-  const ageMinutes = extractRelativeAgeMinutes(source.snippet);
+  // Prefer the search provider's dedicated date field. Fall back
+  // to a relative age embedded in the snippet when it is absent.
+  const providerAge = source.date
+    ? extractRelativeAgeMinutes(source.date)
+    : null;
+  const snippetAge = providerAge === null
+    ? extractRelativeAgeMinutes(source.snippet)
+    : null;
+
+  const ageMinutes = providerAge ?? snippetAge;
+  const ageSource: ClassifiedSource["ageSource"] =
+    providerAge !== null
+      ? "provider_date"
+      : snippetAge !== null
+        ? "snippet_fallback"
+        : "unavailable";
 
   const explicitDate = extractExplicitDate(combinedText);
   const futureLanguage = hasFutureEventLanguage(combinedText);
@@ -723,38 +752,46 @@ function classifyTemporalSource(
   const isRecent =
     constraint.recencyMinutes !== undefined &&
     ageMinutes !== null &&
+    ageMinutes >= 0 &&
     ageMinutes <= constraint.recencyMinutes;
 
   const isEvergreen = isEvergreenContent(source.title);
-
+  const isRoundup = isRoundupContent(source.title);
   const isDevelopment = isDevelopmentSignal(combinedText);
 
   const eligibleDevelopment =
     isRecent &&
     !isFutureEvent &&
     !isEvergreen &&
+    !isRoundup &&
     isDevelopment;
 
-  let reason = "No explicit relative age was found in the search snippet.";
+  let reason = "No usable publication-age evidence was found.";
 
   if (isFutureEvent) {
     reason = "Describes a future event, not a completed development.";
   } else if (ageMinutes !== null && !isRecent) {
-    reason = "Snippet age is outside the requested time window.";
-  } else if (isRecent && isEvergreen) {
-    reason = "Looks like evergreen list or reference content.";
+    reason = "Publication age is outside the requested time window.";
+  } else if (isRoundup) {
+    reason = "Weekly, daily, or periodic roundup; not an individual announcement.";
+  } else if (isEvergreen) {
+    reason = "Looks like evergreen list, guide, documentation, or reference content.";
   } else if (isRecent && !isDevelopment) {
     reason = "Recent content, but no concrete announcement or release signal was detected.";
   } else if (eligibleDevelopment) {
-    reason = "Recent snippet with a concrete announcement or release signal.";
+    reason = ageSource === "provider_date"
+      ? "Recent provider date with a concrete announcement or release signal."
+      : "Recent snippet-age fallback with a concrete announcement or release signal.";
   }
 
   return {
     source,
     ageMinutes,
+    ageSource,
     isRecent,
     isFutureEvent,
     isEvergreen,
+    isRoundup,
     isDevelopmentSignal: isDevelopment,
     eligibleDevelopment,
     reason
@@ -774,8 +811,13 @@ function getTemporalEvidence(
   classified: ClassifiedSource[]
 ): TemporalEvidence {
   return {
-    recentSnippetMatches: classified.filter(item => item.isRecent).length,
-    developmentSignals: classified.filter(
+    recentProviderDateMatches: classified.filter(
+      item => item.isRecent && item.ageSource === "provider_date"
+    ).length,
+    recentSnippetFallbackMatches: classified.filter(
+      item => item.isRecent && item.ageSource === "snippet_fallback"
+    ).length,
+    eligibleDevelopments: classified.filter(
       item => item.eligibleDevelopment
     ).length,
     unverified: classified.filter(
@@ -786,6 +828,9 @@ function getTemporalEvidence(
     ).length,
     excludedEvergreen: classified.filter(
       item => item.isEvergreen
+    ).length,
+    excludedRoundups: classified.filter(
+      item => item.isRoundup
     ).length
   };
 }
@@ -807,6 +852,7 @@ function buildTemporalAnswer(
       item.isRecent &&
       !item.isFutureEvent &&
       !item.isEvergreen &&
+      !item.isRoundup &&
       !item.isDevelopmentSignal
   );
 
@@ -815,7 +861,7 @@ function buildTemporalAnswer(
     "",
     "I checked the search results using the requested time window.",
     "",
-    "**Evidence limitation:** The relative ages below come from search-result snippets. They are not independent verification of the articles' publication timestamps."
+    "**Evidence limitation:** Publication ages are taken from the search provider's date field when available, with snippet-based age used only as a fallback. These are search-result metadata, not independent verification of the full articles."
   ];
 
   if (eligible.length) {
@@ -826,7 +872,8 @@ function buildTemporalAnswer(
         "",
         `**${index + 1}. ${item.source.title}**`,
         item.source.snippet || "The search provider returned no descriptive snippet.",
-        `Search snippet age: ${item.ageMinutes} minutes ago.`,
+        `${item.ageSource === "provider_date" ? "Search provider reported age" : "Snippet age (fallback)"}: ${item.ageMinutes} minutes ago.`,
+        ...(item.source.date ? [`Provider date: ${item.source.date}`] : []),
         `Source: ${item.source.url}`
       );
     });
@@ -856,7 +903,7 @@ function buildTemporalAnswer(
       lines.push(
         "",
         `- **${item.source.title}** — ${item.source.snippet}`,
-        `  Search snippet age: ${item.ageMinutes} minutes ago.`,
+        `  ${item.ageSource === "provider_date" ? "Search provider reported age" : "Snippet age (fallback)"}: ${item.ageMinutes} minutes ago.`,
         `  Source: ${item.source.url}`
       );
     });
@@ -870,6 +917,10 @@ function buildTemporalAnswer(
     item => item.isEvergreen
   ).length;
 
+  const roundupCount = classified.filter(
+    item => item.isRoundup
+  ).length;
+
   const unverifiedCount = classified.filter(
     item => item.ageMinutes === null
   ).length;
@@ -881,6 +932,7 @@ function buildTemporalAnswer(
     `- Unverified or undated results: ${unverifiedCount}`,
     `- Future events excluded: ${futureCount}`,
     `- Evergreen list/reference pages excluded: ${evergreenCount}`,
+    `- Periodic roundups excluded: ${roundupCount}`,
     "",
     "This answer is generated from backend-validated search evidence, not an unrestricted LLM summary."
   );
@@ -899,7 +951,7 @@ function buildFallbackAnswer(
     "I found these web search results. Here is the available information based on their snippets:",
     "",
     ...sources.slice(0, 8).map((source, index) =>
-      `${index + 1}. **${source.title}** (${source.site_name})\n${source.snippet || "No snippet available."}\nSource: ${source.url}`
+      `${index + 1}. **${source.title}** (${source.site_name})\n${source.snippet || "No snippet available."}\n${source.date ? `Provider date: ${source.date}\n` : ""}Source: ${source.url}`
     ),
     "",
     "Note: This is a summary of search snippets, not verification of the full articles or their publication dates."
@@ -1350,6 +1402,7 @@ Title: ${source.title}
 Website: ${source.site_name}
 URL: ${source.url}
 Snippet: ${source.snippet}
+Provider date: ${source.date ?? "Not provided"}
 `.trim()).join("\n\n")}
 
 Now answer the original user question using this evidence.
