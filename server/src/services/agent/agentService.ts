@@ -91,6 +91,8 @@ interface ClassifiedSource {
   isLowValuePage: boolean;
   isDevelopmentSignal: boolean;
   isTopicRelevant: boolean;
+  isExplicitlyExcluded: boolean;
+  isHistoricalEvent: boolean;
   eligibleDevelopment: boolean;
   reason: string;
   supportingSources?: SearchSource[];
@@ -102,6 +104,7 @@ export interface TemporalEvidence {
   eligibleDevelopments: number;
   unverified: number;
   excludedFutureEvents: number;
+  excludedHistoricalEvents: number;
   excludedEvergreen: number;
   excludedRoundups: number;
   excludedLowValuePages: number;
@@ -311,6 +314,119 @@ function sanitizeTemporalQuery(query: string): string {
 // MEMORY RETRIEVAL
 // --------------------------------------------------
 
+
+function getRequestedHistoryDate(query: string): string | null {
+  const todayParts = getIndiaDateParts();
+  const today = new Date(Date.UTC(todayParts.year, todayParts.month - 1, todayParts.day));
+  const normalized = query.toLowerCase();
+
+  // "last Tuesday", "on Monday", and similar weekday references.
+  const weekdayMatch = normalized.match(/\b(last\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/);
+  if (weekdayMatch) {
+    const weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+    const target = weekdays.indexOf(weekdayMatch[2]);
+    let daysBack = (today.getUTCDay() - target + 7) % 7;
+    if (daysBack === 0 || weekdayMatch[1]) daysBack = daysBack === 0 ? 7 : daysBack;
+    today.setUTCDate(today.getUTCDate() - daysBack);
+    return `${today.getUTCFullYear()}-${String(today.getUTCMonth() + 1).padStart(2, "0")}-${String(today.getUTCDate()).padStart(2, "0")}`;
+  }
+
+  // Explicit day/month dates, with the current year as the default.
+  const explicit = query.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)(?:\s+(20\d{2}))?\b|\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(20\d{2}))?\b/i);
+  if (explicit) {
+    const monthNames = ["january","february","march","april","may","june","july","august","september","october","november","december"];
+    const day = Number(explicit[1] || explicit[5]);
+    const monthName = (explicit[2] || explicit[4]).toLowerCase();
+    let year = Number(explicit[3] || explicit[6] || todayParts.year);
+    const month = monthNames.indexOf(monthName) + 1;
+    const check = new Date(Date.UTC(year, month - 1, day));
+    if (check.getUTCMonth() !== month - 1 || check.getUTCDate() !== day) return null;
+    // If no year was supplied and this date is in the future, use the previous year.
+    if (!explicit[3] && !explicit[6] && check.getTime() > today.getTime()) year--;
+    return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
+
+  const iso = query.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  return null;
+}
+
+interface DatedHistoryLookup {
+  requestedDate: string | null;
+  asksAboutHistory: boolean;
+  rows: Array<{
+    conversation_id: string;
+    conversation_title: string;
+    role: string;
+    content: string;
+    created_at: string;
+  }>;
+  relevantRows: Array<{
+    conversation_id: string;
+    conversation_title: string;
+    role: string;
+    content: string;
+    created_at: string;
+  }>;
+}
+
+function isDatedHistoryRequest(query: string): boolean {
+  return /\b(asked|ask|told|discussed|shortlist(?:ed)?|mentioned|conversation|chat|since then|previous(?:ly)?|last\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|on\s+\d{1,2})\b/i.test(query)
+    && getRequestedHistoryDate(query) !== null;
+}
+
+function getDatedHistoryLookup(query: string): DatedHistoryLookup {
+  const requestedDate = getRequestedHistoryDate(query);
+  const asksAboutHistory = isDatedHistoryRequest(query);
+  if (!requestedDate || !asksAboutHistory) {
+    return { requestedDate, asksAboutHistory, rows: [], relevantRows: [] };
+  }
+
+  const rows = db.prepare(`
+    SELECT c.id AS conversation_id, c.title AS conversation_title,
+           m.role, m.content, m.created_at
+    FROM messages m
+    JOIN conversations c ON c.id = m.conversation_id
+    WHERE date(datetime(m.created_at, '+5 hours 30 minutes')) = ?
+      AND m.role IN ('user', 'assistant')
+    ORDER BY m.created_at ASC, m.rowid ASC
+    LIMIT 80
+  `).all(requestedDate) as DatedHistoryLookup['rows'];
+
+  const stop = new Set(['what','when','where','which','about','asked','ask','told','discussed','shortlisted','shortlist','mentioned','conversation','chat','last','this','that','then','since','today','pricing','price','changed','still','correct','answer','any','has','have','did','you','your','the','for','with','from','and','was','were','are','on','in','to','a','an','of','we','i','me','my','our','tools','team','people']);
+  const terms = (query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])
+    .filter(token => token.length > 2 && !stop.has(token));
+  const scored = rows.map(row => {
+    const text = `${row.conversation_title} ${row.content}`.toLowerCase();
+    const score = terms.reduce((total, term) => {
+      const variants = term.endsWith('s') ? [term, term.slice(0, -1)] : [term, `${term}s`];
+      return total + (variants.some(value => text.includes(value)) ? 1 : 0);
+    }, 0);
+    return { row, score };
+  });
+  const relevantRows = terms.length
+    ? scored.filter(item => item.score > 0).map(item => item.row)
+    : rows;
+
+  return { requestedDate, asksAboutHistory, rows, relevantRows };
+}
+
+function getDatedConversationContext(query: string): string {
+  const lookup = getDatedHistoryLookup(query);
+  if (!lookup.requestedDate || !lookup.asksAboutHistory) return '';
+  if (!lookup.rows.length) {
+    return `DATE-SPECIFIC HISTORY LOOKUP: No user/assistant messages were found for ${lookup.requestedDate} (Asia/Kolkata). Do not invent a conversation for that date.`;
+  }
+  if (!lookup.relevantRows.length) {
+    return `DATE-SPECIFIC HISTORY LOOKUP: Messages exist on ${lookup.requestedDate}, but none matched the topic in the user's question. Do not use unrelated conversations.`;
+  }
+  return `DATE-SPECIFIC CONVERSATION HISTORY (${lookup.requestedDate}, Asia/Kolkata):\n` +
+    lookup.relevantRows.map(row =>
+      `[${row.conversation_title}] ${row.role.toUpperCase()}: ${row.content.slice(0, 2200)}`
+    ).join('\n\n') +
+    '\nUse these original messages as the source of truth. Never fill missing original prices, plans, providers, or decisions from general knowledge.';
+}
+
 function getMemoryContext(query: string): string {
   const sections: string[] = [];
 
@@ -389,6 +505,9 @@ function getMemoryContext(query: string): string {
     console.error("Structured memory retrieval failed:", error);
   }
 
+  const datedHistory = getDatedConversationContext(query);
+  if (datedHistory) sections.push(datedHistory);
+
   return sections.length
     ? sections.join("\n\n")
     : "No relevant saved memories were found.";
@@ -444,6 +563,12 @@ MEMORY RULES:
 - Prefer newer current facts over older information.
 - Never treat superseded facts as current preferences.
 - Never invent memories.
+- When the user refers to a past date or weekday, use DATE-SPECIFIC CONVERSATION HISTORY if supplied. Treat original user/assistant messages as evidence; do not substitute unrelated saved facts.
+- When asked whether a previous answer is still correct, identify the prior answer and its claims first, then use web search to verify those claims against current evidence.
+- When asked whether pricing changed, recover the exact provider, plan, billing period, currency, and price from history. Compare like-for-like only. If either old or current price is missing, say it cannot be verified; never infer "unchanged" from missing search results.
+- For a dated-history request, use only DATE-SPECIFIC CONVERSATION HISTORY matching the requested topic. If the prior provider, product, plan, price, or shortlist is absent, ask for the missing detail. Do not replace missing historical context with a generic market overview or pricing table.
+- The backend-resolved history date is authoritative. Never reinterpret "last Tuesday" or substitute another date.
+- Distinguish the date a conversation happened from the date a product change or article was published.
 
 WEB SEARCH RULES:
 - Search when current or external evidence is needed.
@@ -599,7 +724,14 @@ const EVENT_STOP_WORDS = new Set([
   "report", "says", "solution", "solutions", "the", "their",
   "this", "today", "using", "with", "your", "processing", "marketing",
   "technology", "intelligence", "artificial", "enterprise", "purchase",
-  "business", "solution", "solutions", "company", "companies", "launches"
+  "business", "solution", "solutions", "company", "companies", "launches",
+  "acquire", "acquires", "acquired", "acquisition", "partner", "partners",
+  "partnership", "expand", "expands", "expanded", "expansion", "integrate",
+  "integrates", "integrated", "integration", "add", "adds", "added",
+  "power", "powers", "powered", "update", "updates", "updated",
+  "announce", "announces", "announced", "introduce", "introduces",
+  "introduced", "unveil", "unveils", "unveiled", "debut", "debuts",
+  "debuted", "funding", "funded", "investment", "invests", "invested"
 ]);
 
 function normalizeEventToken(token: string): string {
@@ -725,15 +857,20 @@ function hasAnnouncementAction(source: SearchSource): boolean {
 
 function isSameUnderlyingEvent(
   first: ClassifiedSource,
-  second: ClassifiedSource
+  second: ClassifiedSource,
+  userMessage = ""
 ): boolean {
   const firstSource = first.source;
   const secondSource = second.source;
 
+  const requestedOrganizationAnchors = new Set(
+    extractRequestedTopic(userMessage).requiredTerms
+  );
   const firstTitleAnchors = getDistinctiveTitleAnchors(firstSource);
   const secondTitleAnchors = getDistinctiveTitleAnchors(secondSource);
   const sharedTitleAnchors = [...firstTitleAnchors].filter(token =>
-    secondTitleAnchors.has(token)
+    secondTitleAnchors.has(token) &&
+    !requestedOrganizationAnchors.has(token)
   );
 
   const firstSemantic = getSemanticTokens(firstSource);
@@ -773,8 +910,10 @@ function isSameUnderlyingEvent(
   const firstEntities = getEntityAnchors(firstSource);
   const secondEntities = getEntityAnchors(secondSource);
   const sharedNamedEntities = [...firstEntities].filter(token =>
-    secondEntities.has(token) && token.length >= 6 &&
-    !EVENT_STOP_WORDS.has(token)
+    secondEntities.has(token) &&
+    token.length >= 6 &&
+    !EVENT_STOP_WORDS.has(token) &&
+    !requestedOrganizationAnchors.has(token)
   );
 
   return sharedNamedEntities.length >= 2 &&
@@ -809,7 +948,10 @@ const OFFICIAL_COMPANY_DOMAINS = new Set([
   "salesforce.com", "adobe.com", "oracle.com", "cisco.com",
   "crowdstrike.com", "leidos.com", "celigo.com", "automattic.com",
   "sonos.com", "airbnb.com", "intel.com", "amd.com", "qualcomm.com",
-  "samsung.com", " siemens.com", "accenture.com", "deloitte.com"
+  "samsung.com", " siemens.com", "accenture.com", "deloitte.com",
+  "thehackettgroup.com", "okta.com", "launchdarkly.com", "konghq.com",
+  "sailpoint.com", "demandbase.com", "five9.com", "trimble.com", "nooks.ai",
+  "zendesk.com", "writer.com"
 ].map(domain => domain.trim()));
 
 const SOCIAL_HOSTS = new Set([
@@ -841,7 +983,7 @@ function getSourceTrust(source: SearchSource): SourceTrust {
 
   // Identify likely first-party sources only when the hostname's distinctive
   // brand is corroborated by the publisher label or article text.
-  const hostTokens = hostname.split(/[.\\-_]/).filter(token => token.length >= 5);
+  const hostTokens = hostname.split(/[.\-_]/).filter(token => token.length >= 5);
   const textTokens = new Set([...tokenize(`${source.title} ${source.snippet}`)].map(normalizeEventToken));
   const firstPartyMatch = hostTokens.some(token =>
     textTokens.has(normalizeEventToken(token))
@@ -870,7 +1012,8 @@ function getSourceAuthorityScore(source: SearchSource): number {
 }
 
 function deduplicateTemporalEvents(
-  classified: ClassifiedSource[]
+  classified: ClassifiedSource[],
+  userMessage = ""
 ): { items: ClassifiedSource[]; removed: number } {
   const retained: ClassifiedSource[] = [];
   let removed = 0;
@@ -883,6 +1026,9 @@ function deduplicateTemporalEvents(
     const canCluster = candidateTrust !== "social" &&
       candidate.isRecent &&
       !candidate.isFutureEvent &&
+      !candidate.isHistoricalEvent &&
+      !candidate.isExplicitlyExcluded &&
+      candidate.isTopicRelevant &&
       !candidate.isEvergreen &&
       !candidate.isRoundup &&
       !candidate.isLowValuePage &&
@@ -899,13 +1045,16 @@ function deduplicateTemporalEvents(
       getSourceTrust(existing.source) !== "social" &&
       existing.isRecent &&
       !existing.isFutureEvent &&
+      !existing.isHistoricalEvent &&
+      !existing.isExplicitlyExcluded &&
+      existing.isTopicRelevant &&
       !existing.isEvergreen &&
       !existing.isRoundup &&
       !existing.isLowValuePage &&
       existing.announcementType !== "promotion" &&
       existing.announcementType !== "explainer" &&
       existing.announcementType !== "report" &&
-      isSameUnderlyingEvent(existing, candidate)
+      isSameUnderlyingEvent(existing, candidate, userMessage)
     );
 
     if (duplicateIndex === -1) {
@@ -1033,27 +1182,33 @@ function classifyAnnouncementType(
   const text = `${title} ${snippet}`.toLowerCase();
   const headline = title.toLowerCase();
 
-  // Promotions and learning products can contain "AI agent", "launch", and
-  // "product" without reporting a company/product announcement.
   if (
     /\b(course|cohort|bootcamp|training|workshop|masterclass|certification|curriculum|enrol(?:l)?ment|enroll now|register for the course)\b/.test(text) ||
-    /\b(build a useful ai product|no previous product launch required|join our cohort)\b/.test(text)
+    /\b(build a useful ai product|no previous product launch required|join our cohort)\b/.test(text) ||
+    /\b(?:brand|marketing|awareness|advertising) campaign\b/.test(text)
   ) return "promotion";
 
-  // Advice about launch strategy is not itself a launch announcement.
   if (
     /\b(strategy|strategies|playbook|checklist|how to plan|marketing plan)\b/.test(headline) &&
     /\b(product launch|launch strategy|launching a product)\b/.test(text)
   ) return "explainer";
-
   if (/\b(report|insight report|market report|survey|index|benchmark|research paper|whitepaper|study finds)\b/.test(text)) return "report";
-  if (/\b(what is|what are|how to|guide to|explained|explainer|tutorial|beginner.?s guide|101:)\b/.test(text)) return "explainer";
+  if (/\b(what is|what are|how to|guide to|explained|explainer|tutorial|beginner.?s guide|101:)\b/.test(headline)) return "explainer";
+
+  // "For partners" and partner-enablement updates are not partnerships.
+  const partnerEnablement =
+    /\b(?:for|to|with) partners\b|\bpartner (?:center|portal|benefits|opportunities|enablement|program|programme|call cadence)\b|\bpartners? (?:can|will) (?:use|access|learn|explore|grow|sell|market)\b|\b(?:grow usage|upsell|marketing, sales|sales and customer success)\b/i.test(text);
+  const explicitPartnership =
+    /\b(?:partnered with|partners with|partnership with|partners? on|strategic partnership|forms? (?:a|an) partnership|enters? into (?:a|an) partnership|collaborat(?:es|ed|ing) with|joint venture with)\b/i.test(text);
+
   if (/\b(acquir(?:e|es|ed|ing)|acquisition|buys|bought)\b/.test(text)) return "acquisition";
-  if (/\b(partner(?:s|ed|ing|ship)|strategic alliance|joint venture)\b/.test(text)) return "partnership";
-  // General-availability announcements are product releases even when the
-  // headline uses editorial wording such as "what's new" rather than "launch".
-  if (/\b(now generally available|generally available|general availability|available now|now available)\b/.test(text)) return "feature_release";
-  if (/\b(feature|capability|update|adds support|now supports|platform|fabric)\b/.test(text) && /\b(releas\w*|launch\w*|available|roll(?:s|ed)? out|introduc\w*|announc\w*|preview|generally available)\b/.test(text)) return "feature_release";
+  if (explicitPartnership && !partnerEnablement) return "partnership";
+  if (/\b(?:now generally available|generally available|general availability|available now|now available)\b/.test(text)) return "feature_release";
+  if (/\bGA\b/i.test(headline) && /\b(product|platform|feature|agent|fabric)\b/i.test(text)) return "feature_release";
+  if (
+    /\b(feature|capability|update|platform|fabric|integration)\b/.test(text) &&
+    /\b(releas\w*|launch\w*|available|roll(?:s|ed)? out|introduc\w*|announc\w*|preview|adds support|now supports)\b/.test(text)
+  ) return "feature_release";
   if (/^\s*meet\s+[a-z0-9]/i.test(title) || /\b(launch\w*|debut\w*|unveil\w*|introduc\w*|now available|general availability|announc\w*)\b/.test(text)) return "product_launch";
   if (/\b(announc\w*|reveal\w*|unveil\w*)\b/.test(text)) return "other_announcement";
   return "general_coverage";
@@ -1181,7 +1336,14 @@ function isRoundupContent(title: string, url: string, snippet = ""): boolean {
     /\b(?:catch\s+up\s+on|here(?:'|’)s\s+your|look\s+back\s+at)\b.{0,100}\b(?:news|stories|developments|recap)\b/i.test(snippet) ||
     /\bupdated\s+(?:each|every)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week)\b/i.test(title);
 
-  if (roundupSignals) return true;
+  let titleAndPath = title.toLowerCase();
+  try { titleAndPath += ` ${new URL(url).pathname.toLowerCase()}`; } catch { /* title-only classification */ }
+  const dealRoundup =
+    /\b(?:deals?|funding|raises|m\s*&\s*a|mergers?\s+and\s+acquisitions?)\b/i.test(titleAndPath) &&
+    /\b(?:20\d{2}|weekly|monthly|roundup|digest|funding|raises|private equity|transactions|deals-and-raises)\b/i.test(titleAndPath) &&
+    !/\b(?:to acquire|acquires|acquired|announces acquisition|launches|introduces)\b/i.test(title);
+
+  if (roundupSignals || dealRoundup) return true;
 
   try {
     return /(?:^|\/)top[-_\w]*news[-_\w]*roundup(?:[/.?]|$)/i.test(new URL(url).pathname);
@@ -1218,6 +1380,12 @@ function isLowValueTemporalPage(
       [...parsed.searchParams.keys()].some(key => /^(?:page|offset|start|o|category|tag)$/i.test(key))
     ) return true;
 
+    // Date-bucketed announcement pages are archives, not individual stories.
+    if (
+      /\/announcements?\/(?:19|20)\d{2}[-/]?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(path) ||
+      /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+(?:19|20)\d{2}\s+(?:announcements?|releases?)\b/i.test(normalizedTitle)
+    ) return true;
+
     // Search result headlines sometimes describe a listing page rather than
     // an article. These title patterns are deliberately specific.
     if (
@@ -1244,9 +1412,9 @@ function isLowValueTemporalPage(
 }
 
 function isDevelopmentSignal(text: string): boolean {
-  return /\b(announc\w*|launch\w*|releas\w*|ship\w*|introduc\w*|unveil\w*|roll(?:s|ed)? out|debut\w*|acquir\w*|fund(?:ing|ed)?|partner(?:ship|s|ed)?|open.source|made available|now available|generally available|general availability)\b/i.test(
-    text
-  );
+  const explicitAction = /\b(announc\w*|launch\w*|releas\w*|ship\w*|introduc\w*|unveil\w*|roll(?:s|ed)? out|debut\w*|acquir\w*|fund(?:ing|ed)?|partner(?:ship|s|ed)?|open.source|made available|now available|generally available|general availability|adds support|now supports|expands? support|integrat(?:e|es|ed|ion))\b/i.test(text);
+  const acronymGaRelease = /\bGA\b/i.test(text) && /\b(announcement|product|platform|feature|agent|fabric)\b/i.test(text);
+  return explicitAction || acronymGaRelease;
 }
 
 function parseProviderPublicationDate(value: string): number | null {
@@ -1263,20 +1431,171 @@ function parseProviderPublicationDate(value: string): number | null {
   return Number.isNaN(parsed) ? null : parsed;
 }
 
-function isAgentFocusedRequest(userMessage: string): boolean {
-  return /\b(ai\s+agents?|agents?\s+(?:for|in|that)|agentic)\b/i.test(userMessage);
+function extractRequestedTopic(userMessage: string): {
+  label: string;
+  terms: string[];
+  requiredTerms: string[];
+  requiresAi: boolean;
+  requiresAgent: boolean;
+  requiresPlatform: boolean;
+} {
+  let topic = userMessage
+    .split(/[.!?\n]/)[0]
+    .replace(/^\s*(?:please\s+)?(?:find|search for|search|look up|show me|tell me about)\s+/i, "")
+    .replace(/\b(?:from|during|within|over)\s+(?:the\s+)?(?:last|past)\s+\d+\s+(?:minutes?|hours?|days?|weeks?|months?)\b/gi, " ")
+    .replace(/\b(?:today|yesterday|tomorrow|this week|last week|past week|this month|last month)\b/gi, " ")
+    .replace(/\b(?:group|cluster|deduplicate|remove duplicates|prioritize|prefer|exclude|omit|ignore|rank|summarize)\b[\s\S]*$/i, "")
+    .replace(/\s+/g, " ")
+    .replace(/[,\.\s]+$/, "")
+    .trim();
+
+  const ignored = new Set([
+    "find", "search", "latest", "recent", "news", "updates", "update",
+    "announcements", "announcement", "launches", "launch", "launched",
+    "releases", "release", "released", "products", "product", "major",
+    "developments", "development", "company", "companies", "official",
+    "sources", "source", "coverage", "information", "about", "from",
+    "during", "within", "last", "past", "days", "weeks", "months",
+    "hours", "minutes", "the", "and", "for", "with", "that", "this",
+    "their", "they", "are", "was", "were", "became", "generally",
+    "available", "platform", "platforms", "features", "feature", "ai", "artificial", "intelligence"
+  ]);
+
+  const words = topic.match(/[\p{L}\p{N}]+/gu) ?? [];
+  const terms = [...new Set(words.map(word => word.toLowerCase())
+    .filter(word => word.length > 1 && !ignored.has(word)))];
+  const namedTerms = [...new Set((topic.match(/\b[A-Z][A-Za-z0-9.-]{2,}\b/g) ?? [])
+    .map(word => word.toLowerCase())
+    .filter(word => !ignored.has(word) && !["find", "search", "show", "tell"].includes(word)))];
+  const requiresAi = /\bai\b|artificial intelligence/i.test(topic);
+  const requiresAgent = /\bai\s+agents?|\bagentic\b/i.test(topic);
+
+  return {
+    label: topic || "Requested topic",
+    terms,
+    requiredTerms: namedTerms,
+    requiresAi,
+    requiresAgent,
+    requiresPlatform: /\bplatforms?\b/i.test(topic)
+  };
+}
+
+function hasAiTopicSignal(text: string): boolean {
+  return /\b(ai|artificial intelligence|machine learning|generative|llm|large language model|copilot|foundation model|neural network|agentic)\b/i.test(text);
+}
+
+function hasAgentTopicSignal(text: string): boolean {
+  return /\b(ai\s+agents?|agents?|agentic|autonomous\s+(?:ai\s+)?systems?|agent framework)\b/i.test(text);
+}
+
+function extractExplicitExclusions(userMessage: string): string[] {
+  const match = userMessage.match(/\b(?:exclude|excluding|omit|ignore|do not include|don't include)\s+([^.!?\n]+)/i);
+  if (!match) return [];
+
+  const clause = match[1].toLowerCase();
+  const exclusions = new Set<string>();
+
+  // Preserve well-known technology names even when punctuation or conjunctions
+  // make a simple comma/"and" split ambiguous (for example, ".NET and Windows").
+  if (/\.net\b|\bdotnet\b/.test(clause)) exclusions.add(".net");
+  if (/\bwindows\b/.test(clause)) exclusions.add("windows");
+  if (/\bgeneral\s+technology\b|\bgeneral\s+tech\b/.test(clause)) {
+    exclusions.add("general technology");
+  }
+
+  const cleaned = clause
+    .replace(/\.net\b|\bdotnet\b|\bwindows\b|\bgeneral\s+technology\b|\bgeneral\s+tech\b/g, " ")
+    .replace(/\b(?:unrelated|irrelevant|general|announcements?|articles?|results?|coverage|and|or)\b/gi, " ");
+
+  for (const value of cleaned.split(/[,;]/)) {
+    const normalized = value.trim().replace(/^[\s:;.-]+|[\s:;.-]+$/g, "");
+    if (normalized.length > 1) exclusions.add(normalized);
+  }
+
+  return [...exclusions];
+}
+
+function matchesExplicitExclusion(source: SearchSource, userMessage: string): boolean {
+  const text = `${source.title} ${source.snippet} ${source.url}`.toLowerCase();
+  const exclusions = extractExplicitExclusions(userMessage);
+
+  return exclusions.some(exclusion => {
+    if (exclusion === ".net" || exclusion === "net") {
+      return /(?:\.net\b|\bdotnet\b)/i.test(text);
+    }
+    if (exclusion === "windows") return /\bwindows\b/i.test(text);
+    if (exclusion === "general technology" || exclusion === "technology") {
+      return /\b(general technology|technology news|technology industry|tech industry|general tech)\b/i.test(text) && !hasAiTopicSignal(text);
+    }
+    const escaped = exclusion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`\\b${escaped}\\b`, "i").test(text);
+  });
 }
 
 function isRelevantToRequestedTopic(
   source: SearchSource,
   userMessage: string
 ): boolean {
-  // Keep AI-agent searches focused: a general AI/business product launch
-  // should not qualify unless the result itself discusses agents or agentic
-  // capabilities. Other topic types retain the existing broad behavior.
-  if (!isAgentFocusedRequest(userMessage)) return true;
-  return /\b(ai\s+agents?|agents?|agentic|autonomous\s+systems?)\b/i.test(
-    `${source.title} ${source.snippet}`
+  const requested = extractRequestedTopic(userMessage);
+  const text = `${source.title} ${source.snippet}`.toLowerCase();
+  const normalizeTerm = (value: string): string => {
+    const term = value.toLowerCase();
+    if (term.length > 4 && term.endsWith("ies")) return `${term.slice(0, -3)}y`;
+    if (term.length > 3 && term.endsWith("s") && !term.endsWith("ss")) return term.slice(0, -1);
+    return term;
+  };
+  const sourceTerms = new Set((text.match(/[\p{L}\p{N}]+/gu) ?? []).map(normalizeTerm));
+
+  if (requested.requiredTerms.length) {
+    const titleTerms = new Set(source.title.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
+    let hostname = "";
+    try {
+      hostname = new URL(source.url).hostname.toLowerCase().replace(/^www\./, "");
+    } catch {
+      return false;
+    }
+    const organizationMatches = requested.requiredTerms.every(term =>
+      titleTerms.has(term) || hostname.split(/[.\-_]/).includes(term)
+    );
+    if (!organizationMatches) return false;
+  }
+
+  if (requested.requiresAi && !hasAiTopicSignal(text)) return false;
+  if (requested.requiresAgent && !hasAgentTopicSignal(text)) return false;
+  if (requested.requiresPlatform && !/\b(platform|platforms|fabric|ecosystem|cloud|suite)\b/i.test(text)) return false;
+  if (!requested.terms.length) return true;
+
+  const overlap = requested.terms.filter(term => sourceTerms.has(normalizeTerm(term))).length;
+  const ratio = overlap / requested.terms.length;
+
+  // Agent product announcements can use distinct product names while the
+  // snippet still explicitly identifies agents and a release/GA action.
+  const agentIntentMatch = requested.requiresAgent &&
+    hasAgentTopicSignal(text) &&
+    (hasAnnouncementAction(source) || /\b(general availability|GA announcement)\b/i.test(text));
+  if (agentIntentMatch) return true;
+
+  return requested.requiredTerms.length > 0
+    ? overlap >= 1
+    : overlap >= 1 && (ratio >= 0.2 || requested.terms.length <= 2);
+}
+
+function hasHistoricalEventLanguage(text: string): boolean {
+  const currentYear = getIndiaDateParts().year;
+  const oldYear = (yearText: string | undefined): boolean =>
+    Boolean(yearText && Number(yearText) < currentYear);
+
+  const patterns = [
+    /\b(?:originally|first|initially)?\s*(?:announced|launched|introduced|released|unveiled|debuted|acquired|partnered)\b.{0,100}?\b(?:in|at|during)\s+((?:19|20)\d{2})\b/gi,
+    /\b(?:from|at|during)\s+(?:the\s+)?((?:19|20)\d{2})\s+(?:event|conference|summit|launch|announcement|keynote)\b/gi,
+    /\b(?:since|as of)\s+((?:19|20)\d{2})\b/gi,
+    /\b(?:launched|introduced|released|announced)\s+in\s+((?:19|20)\d{2})\b/gi,
+    /\b(?:launched|introduced|released|announced|unveiled)\s+(?:in|during)\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+((?:19|20)\d{2})\b/gi,
+    /\b(?:first|originally)\s+(?:announced|launched|introduced|released)\b.{0,100}\b((?:19|20)\d{2})\b/gi
+  ];
+
+  return patterns.some(pattern =>
+    [...text.matchAll(pattern)].some(match => oldYear(match[1]))
   );
 }
 
@@ -1314,6 +1633,8 @@ function classifyTemporalSource(
 
   const explicitDate = extractExplicitDate(combinedText);
   const futureLanguage = hasFutureEventLanguage(combinedText);
+  const historicalEventLanguage = hasHistoricalEventLanguage(combinedText);
+  const isHistoricalEvent = historicalEventLanguage;
   const isFutureEvent =
     (futureLanguage && explicitDate !== null && explicitDate.getTime() > Date.now()) ||
     (futureLanguage && hasFutureReleaseTiming(combinedText));
@@ -1338,7 +1659,8 @@ function classifyTemporalSource(
   const isRoundup = isRoundupContent(source.title, source.url, source.snippet);
   const isLowValuePage = isLowValueTemporalPage(source.title, source.url);
   const isDevelopment = isDevelopmentSignal(combinedText);
-  const isTopicRelevant = isRelevantToRequestedTopic(source, userMessage);
+  const isExplicitlyExcluded = matchesExplicitExclusion(source, userMessage);
+  const isTopicRelevant = isRelevantToRequestedTopic(source, userMessage) && !isExplicitlyExcluded;
   const announcementType = classifyAnnouncementType(source.title, source.snippet);
   const isQualifyingAnnouncement = [
     "product_launch",
@@ -1360,9 +1682,11 @@ function classifyTemporalSource(
   const eligibleDevelopment =
     isRecent &&
     !isFutureEvent &&
+    !isHistoricalEvent &&
     !isEvergreen &&
     !isRoundup &&
     !isLowValuePage &&
+    !isExplicitlyExcluded &&
     isTopicRelevant &&
     isDevelopment &&
     isQualifyingAnnouncement &&
@@ -1370,8 +1694,12 @@ function classifyTemporalSource(
 
   let reason = "No usable publication-age evidence was found.";
 
-  if (isFutureEvent) {
+  if (isExplicitlyExcluded) {
+    reason = "Matches a topic or category explicitly excluded by the user.";
+  } else if (isFutureEvent) {
     reason = "Describes a future event, not a completed development.";
+  } else if (isHistoricalEvent) {
+    reason = "Describes an older event or release, not a development from the requested publication window.";
   } else if (isRoundup) {
     reason = "Periodic roundup or digest; not an individual announcement.";
   } else if (isLowValuePage) {
@@ -1391,7 +1719,7 @@ function classifyTemporalSource(
   } else if (isRecent && getSourceTrust(source) === "unknown") {
     reason = "Publisher is not on the recognized official, established, or specialist source lists; needs corroboration before qualifying.";
   } else if (isRecent && !isTopicRelevant) {
-    reason = "Announcement does not clearly match the requested AI-agent topic.";
+    reason = "Result does not sufficiently match the requested topic.";
   } else if (isRecent && !isDevelopment) {
     reason = "Recent content, but no concrete announcement or release signal was detected.";
   } else if (isRecent && !isQualifyingAnnouncement) {
@@ -1414,6 +1742,8 @@ function classifyTemporalSource(
     isLowValuePage,
     isDevelopmentSignal: isDevelopment,
     isTopicRelevant,
+    isExplicitlyExcluded,
+    isHistoricalEvent,
     eligibleDevelopment,
     reason
   };
@@ -1449,6 +1779,9 @@ function getTemporalEvidence(
     excludedFutureEvents: classified.filter(
       item => item.isFutureEvent
     ).length,
+    excludedHistoricalEvents: classified.filter(
+      item => item.isHistoricalEvent
+    ).length,
     excludedEvergreen: classified.filter(
       item => item.isEvergreen
     ).length,
@@ -1469,27 +1802,44 @@ function getTemporalEvidence(
 function buildTemporalAnswer(
   classified: ClassifiedSource[],
   constraint: TemporalConstraint,
-  duplicateCoverageRemoved: number
+  duplicateCoverageRemoved: number,
+  userMessage: string
 ): string {
-  const eligible = classified.filter(
-    item => item.eligibleDevelopment
-  );
+  const eligible = classified
+    .filter(item => item.eligibleDevelopment)
+    .sort((a, b) => {
+      const authorityDifference =
+        getSourceAuthorityScore(b.source) - getSourceAuthorityScore(a.source);
+      if (authorityDifference !== 0) return authorityDifference;
+      return (a.ageMinutes ?? Number.MAX_SAFE_INTEGER) -
+        (b.ageMinutes ?? Number.MAX_SAFE_INTEGER);
+    });
 
-  const recentButNotAnnouncements = classified.filter(
-    item =>
-      item.isRecent &&
-      !item.isFutureEvent &&
-      !item.isEvergreen &&
-      !item.isRoundup &&
-      !item.isLowValuePage &&
-      !item.isDevelopmentSignal &&
-      item.announcementType !== "report" &&
-      item.announcementType !== "explainer" &&
-      item.announcementType !== "promotion"
-  );
+  const recentButNotAnnouncements = classified
+    .filter(
+      item =>
+        item.isRecent &&
+        !item.isFutureEvent &&
+        !item.isHistoricalEvent &&
+        !item.isExplicitlyExcluded &&
+        item.isTopicRelevant &&
+        !item.isEvergreen &&
+        !item.isRoundup &&
+        !item.isLowValuePage &&
+        !item.isDevelopmentSignal &&
+        item.announcementType !== "report" &&
+        item.announcementType !== "explainer" &&
+        item.announcementType !== "promotion"
+    )
+    .sort((a, b) =>
+      getSourceAuthorityScore(b.source) - getSourceAuthorityScore(a.source) ||
+      (a.ageMinutes ?? Number.MAX_SAFE_INTEGER) -
+        (b.ageMinutes ?? Number.MAX_SAFE_INTEGER)
+    );
 
+  const requestedTopic = extractRequestedTopic(userMessage).label;
   const lines: string[] = [
-    `## AI-agent developments: ${constraint.description}`,
+    `## ${requestedTopic}: ${constraint.description}`,
     "",
     constraint.windowType === "calendar"
       ? `India time (Asia/Kolkata): ${new Date(constraint.startAt!).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} to ${new Date(constraint.endAt! - 1).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} (inclusive).`
@@ -1554,6 +1904,31 @@ function buildTemporalAnswer(
     });
   }
 
+  const rejectedCandidates = classified
+    .filter(item =>
+      item.isRecent &&
+      !item.isExplicitlyExcluded &&
+      !item.eligibleDevelopment &&
+      getSourceTrust(item.source) !== "social"
+    )
+    .sort((a, b) =>
+      getSourceAuthorityScore(b.source) - getSourceAuthorityScore(a.source) ||
+      (a.ageMinutes ?? Number.MAX_SAFE_INTEGER) - (b.ageMinutes ?? Number.MAX_SAFE_INTEGER)
+    )
+    .slice(0, 5);
+
+  if (rejectedCandidates.length) {
+    lines.push("", "### Recent candidates not promoted", "", "These were published within the requested window but failed at least one qualification rule:");
+    rejectedCandidates.forEach(item => {
+      lines.push(
+        "",
+        `- **${item.source.title}** — ${item.reason}`,
+        `  Classification: ${item.announcementType.replace(/_/g, " ")}; publisher: ${getSourceTrust(item.source)}.`,
+        `  Source: ${item.source.url}`
+      );
+    });
+  }
+
   const futureCount = classified.filter(
     item => item.isFutureEvent
   ).length;
@@ -1583,12 +1958,18 @@ function buildTemporalAnswer(
     `- Courses and promotional results excluded: ${classified.filter(item => item.announcementType === "promotion").length}`,
     `- Social posts and discussion threads excluded as primary evidence: ${classified.filter(item => getSourceTrust(item.source) === "social").length}`,
     `- Unrated publishers excluded as standalone evidence: ${classified.filter(item => getSourceTrust(item.source) === "unknown").length}`,
-    `- Unverified or undated results: ${unverifiedCount}`,
     `- Future events excluded: ${futureCount}`,
+    `- Historical event references excluded: ${classified.filter(item => item.isHistoricalEvent).length}`,
+    `- Results without publication-age evidence: ${unverifiedCount}`,
     `- Evergreen list/reference pages excluded: ${evergreenCount}`,
     `- Periodic roundups excluded: ${roundupCount}`,
     `- Low-value landing pages excluded: ${lowValueCount}`,
-    `- Results outside the requested topic excluded: ${classified.filter(item => item.isRecent && !item.isTopicRelevant).length}`,
+    `- Results outside the requested topic excluded: ${classified.filter(item => item.isRecent && !item.isTopicRelevant && !item.isExplicitlyExcluded).length}`,
+    `- Results matching explicit user exclusions: ${classified.filter(item => item.isRecent && item.isExplicitlyExcluded).length}`,
+    `- Recent topic-matched candidates rejected by publisher policy: ${classified.filter(item => item.isRecent && item.isTopicRelevant && !item.isExplicitlyExcluded && !item.eligibleDevelopment && getSourceTrust(item.source) === "unknown").length}`,
+    `- Recent topic-matched candidates rejected by announcement classification: ${classified.filter(item => item.isRecent && item.isTopicRelevant && !item.isExplicitlyExcluded && !item.eligibleDevelopment && ["report", "explainer", "promotion", "general_coverage"].includes(item.announcementType)).length}`,
+    `- Recent topic-matched candidates rejected as low-value pages: ${classified.filter(item => item.isRecent && item.isTopicRelevant && !item.isExplicitlyExcluded && !item.eligibleDevelopment && item.isLowValuePage).length}`,
+    `- Recent topic-matched candidates rejected as historical/future/roundup/evergreen: ${classified.filter(item => item.isRecent && item.isTopicRelevant && !item.isExplicitlyExcluded && !item.eligibleDevelopment && (item.isHistoricalEvent || item.isFutureEvent || item.isRoundup || item.isEvergreen)).length}`,
     `- Duplicate coverage items removed: ${duplicateCoverageRemoved}`,
     "",
     "This answer is generated using search-result metadata and backend filtering rules. Search snippets are not full-article verification; check linked primary sources before treating a development as confirmed."
@@ -1893,8 +2274,44 @@ export async function runAgent(
 
   saveMessage(conversationId, "user", userMessage);
 
+  const datedHistory = getDatedHistoryLookup(userMessage);
   const memoryContext = getMemoryContext(userMessage);
   const history = loadConversationHistory(conversationId);
+
+  // Historical comparisons must be grounded in the actual saved conversation.
+  // Never fall through to a generic web answer when the requested history is absent.
+  if (datedHistory.asksAboutHistory && datedHistory.requestedDate) {
+    const dateLabel = new Intl.DateTimeFormat("en-IN", {
+      timeZone: "Asia/Kolkata", weekday: "long", day: "numeric", month: "long", year: "numeric"
+    }).format(new Date(`${datedHistory.requestedDate}T12:00:00+05:30`));
+    let answer: string;
+    if (!datedHistory.rows.length) {
+      answer = `I couldn't find a saved conversation for ${dateLabel} (Asia/Kolkata). I haven't searched or compared anything because I don't have the original details. If you share the earlier question or the names/details, I'll continue from there.`;
+    } else if (!datedHistory.relevantRows.length) {
+      answer = `I found saved messages on ${dateLabel}, but none clearly match this topic. I don't want to use an unrelated conversation or invent the missing details. Please share the relevant question or a keyword from that chat.`;
+    } else {
+      // A matched historical conversation can proceed to the normal agent with the
+      // exact messages included in memoryContext.
+      answer = "";
+    }
+    if (answer) {
+      saveMessage(conversationId, "assistant", answer, {
+        history_lookup: {
+          requestedDate: datedHistory.requestedDate,
+          status: datedHistory.rows.length ? "topic_not_found" : "no_history",
+          matchedMessages: datedHistory.relevantRows.length
+        }
+      });
+      return {
+        conversationId,
+        answer,
+        model: process.env.LLM_MODEL ?? "openai/gpt-oss-20b",
+        sources: [],
+        toolCalls: 0,
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+      };
+    }
+  }
 
   const temporalConstraint =
     detectTemporalConstraint(userMessage);
@@ -2037,7 +2454,7 @@ export async function runAgent(
       temporalConstraint,
       userMessage
     );
-    const deduplicated = deduplicateTemporalEvents(classified);
+    const deduplicated = deduplicateTemporalEvents(classified, userMessage);
     responseSources = deduplicated.items.flatMap(item => [
       item.source,
       ...(item.supportingSources ?? [])
@@ -2053,7 +2470,8 @@ export async function runAgent(
     answer = buildTemporalAnswer(
       deduplicated.items,
       temporalConstraint,
-      deduplicated.removed
+      deduplicated.removed,
+      userMessage
     );
   }
 
