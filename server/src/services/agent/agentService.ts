@@ -84,6 +84,7 @@ interface ClassifiedSource {
   isFutureEvent: boolean;
   isEvergreen: boolean;
   isRoundup: boolean;
+  isLowValuePage: boolean;
   isDevelopmentSignal: boolean;
   eligibleDevelopment: boolean;
   reason: string;
@@ -97,6 +98,8 @@ export interface TemporalEvidence {
   excludedFutureEvents: number;
   excludedEvergreen: number;
   excludedRoundups: number;
+  excludedLowValuePages: number;
+  duplicateCoverageRemoved: number;
 }
 
 function saveMessage(
@@ -532,6 +535,151 @@ function isSameAnnouncement(
   );
 }
 
+function getEventTitleTokens(source: SearchSource): Set<string> {
+  const generic = new Set([
+    "about", "after", "agent", "agents", "announce", "announces",
+    "announced", "announcement", "announcing", "available", "based",
+    "build", "built", "company", "commitment", "expands", "for",
+    "from", "into", "launch", "launches", "launched", "new", "open",
+    "platform", "release", "releases", "released", "runtime", "that",
+    "the", "their", "this", "with"
+  ]);
+
+  return new Set(
+    [...tokenize(source.title)].filter(token => !generic.has(token))
+  );
+}
+
+function isSameUnderlyingEvent(
+  first: SearchSource,
+  second: SearchSource
+): boolean {
+  if (isSameAnnouncement(first, second)) return true;
+
+  const firstTitleTokens = tokenize(first.title);
+  const secondTitleTokens = tokenize(second.title);
+  const sharedTitleTokens = [...firstTitleTokens].filter(token =>
+    secondTitleTokens.has(token)
+  );
+  const hasDistinctiveSharedTerm = sharedTitleTokens.some(token =>
+    token.length >= 7
+  );
+
+  // Require multiple shared title terms and at least one distinctive term.
+  // This catches alternate headlines for the same company/product event
+  // without merging articles that merely discuss the same broad topic.
+  if (sharedTitleTokens.length >= 2 && hasDistinctiveSharedTerm) {
+    const titleUnion = new Set([
+      ...firstTitleTokens,
+      ...secondTitleTokens
+    ]).size;
+    const titleOverlap = sharedTitleTokens.length / titleUnion;
+    if (titleOverlap >= 0.16) return true;
+  }
+
+  const firstAnchors = getEventTitleTokens(first);
+  const secondAnchors = getEventTitleTokens(second);
+  const sharedAnchors = [...firstAnchors].filter(token =>
+    secondAnchors.has(token)
+  );
+
+  return sharedAnchors.length >= 2 &&
+    sharedAnchors.some(token => token.length >= 7);
+}
+
+function getSourceAuthorityScore(source: SearchSource): number {
+  let score = 0;
+  let hostname = "";
+
+  try {
+    hostname = new URL(source.url).hostname
+      .toLowerCase()
+      .replace(/^www\./, "");
+  } catch {
+    return score;
+  }
+
+  const hostTokens = new Set(
+    hostname.split(/[.\-_]/).filter(token => token.length >= 4)
+  );
+  const generic = new Set([
+    "about", "after", "agent", "agents", "announce", "announces",
+    "announced", "announcement", "available", "based", "build",
+    "built", "company", "commitment", "expands", "embedded", "from",
+    "into", "launch", "launches", "launched", "payments", "platform",
+    "release", "releases", "released", "runtime", "with"
+  ]);
+  const entityTokens = [...tokenize(source.title)]
+    .filter(token => token.length >= 4 && !generic.has(token));
+
+  // Prefer a likely first-party domain only when a distinctive title token
+  // appears as a complete hostname label (not an arbitrary substring).
+  if (entityTokens.some(token => hostTokens.has(token))) score += 100;
+
+  if (/\b(press|newsroom|company-news|press-center)\b/i.test(source.url)) {
+    score += 20;
+  }
+
+  if (/^(?:www\.)?(?:prnewswire|businesswire|globenewswire)\.com$/i.test(hostname)) {
+    score += 70;
+  }
+
+  if (source.snippet.length > 100) score += 2;
+  return score;
+}
+
+function deduplicateTemporalEvents(
+  classified: ClassifiedSource[]
+): { items: ClassifiedSource[]; removed: number } {
+  const retained: ClassifiedSource[] = [];
+  let removed = 0;
+
+  for (const candidate of classified) {
+    // Low-value classification affects whether a page is shown as coverage,
+    // but must not prevent a genuine article/announcement from being grouped
+    // with another report of the same event.
+    const canCluster = candidate.isRecent &&
+      !candidate.isFutureEvent &&
+      !candidate.isEvergreen &&
+      !candidate.isRoundup;
+
+    if (!canCluster) {
+      retained.push(candidate);
+      continue;
+    }
+
+    const duplicateIndex = retained.findIndex(existing =>
+      existing.isRecent &&
+      !existing.isFutureEvent &&
+      !existing.isEvergreen &&
+      !existing.isRoundup &&
+      isSameUnderlyingEvent(existing.source, candidate.source)
+    );
+
+    if (duplicateIndex === -1) {
+      retained.push(candidate);
+      continue;
+    }
+
+    const existing = retained[duplicateIndex];
+    const candidateScore =
+      getSourceAuthorityScore(candidate.source) +
+      (candidate.eligibleDevelopment ? 15 : 0) +
+      (!candidate.isLowValuePage ? 5 : 0);
+    const existingScore =
+      getSourceAuthorityScore(existing.source) +
+      (existing.eligibleDevelopment ? 15 : 0) +
+      (!existing.isLowValuePage ? 5 : 0);
+
+    if (candidateScore > existingScore) {
+      retained[duplicateIndex] = candidate;
+    }
+    removed++;
+  }
+
+  return { items: retained, removed };
+}
+
 function extractValidSources(
   results: SearchSource[]
 ): SearchSource[] {
@@ -548,41 +696,24 @@ function extractValidSources(
     }
 
     const normalizedUrl = normalizeSourceUrl(result.url);
+    if (!normalizedUrl || seenUrls.has(normalizedUrl)) continue;
 
-    if (!normalizedUrl || seenUrls.has(normalizedUrl)) {
-      continue;
-    }
-
-    const candidate: SearchSource = {
+    seenUrls.add(normalizedUrl);
+    sources.push({
       title: result.title.trim(),
       url: normalizedUrl,
-      site_name:
-        result.site_name?.trim() ||
-        new URL(normalizedUrl).hostname,
+      site_name: result.site_name?.trim() || new URL(normalizedUrl).hostname,
       snippet: result.snippet.trim(),
       ...(typeof result.date === "string" && result.date.trim()
         ? { date: result.date.trim() }
         : {})
-    };
-
-    const duplicateAnnouncement = sources.some(existing =>
-      isSameAnnouncement(existing, candidate)
-    );
-
-    if (duplicateAnnouncement) continue;
-
-    seenUrls.add(normalizedUrl);
-    sources.push(candidate);
+    });
 
     if (sources.length >= MAX_SOURCES) break;
   }
 
   return sources;
 }
-
-// --------------------------------------------------
-// TEMPORAL EVIDENCE VALIDATION
-// --------------------------------------------------
 
 function extractRelativeAgeMinutes(
   text: string
@@ -708,8 +839,52 @@ function isEvergreenContent(title: string): boolean {
   return /\b(\d+\s+(?:best|top)|(?:best|top)\s+\d+|(?:best|top)\s+.*(?:tools?|platforms?|frameworks?|agents?|software|companies)|frameworks?\s+list|directory|companies|company\s+list|list\s+of|catalog(?:ue)?|tutorial|codelab|documentation|developer\s+guide|beginner.?s\s+guide|complete\s+guide|ultimate\s+guide|how[\s-]+to|comparison\s+of|getting\s+started|api\s+reference)\b/i.test(title);
 }
 
-function isRoundupContent(title: string): boolean {
-  return /\b(weekly|daily|monthly|roundup|round-up|digest|week\s+of|this\s+week|top\s+stories|news\s+today)\b/i.test(title);
+function isRoundupContent(title: string, url: string): boolean {
+  const combined = `${title} ${url}`.toLowerCase();
+
+  return /\b(weekly|daily|monthly|roundup|round-up|digest|week[\s-]+of|this[\s-]+week|top[\s-]+stories|news[\s-]+today)\b/i.test(combined) ||
+    /(?:^|\/)top[-_\w]*news[-_\w]*roundup(?:[/.?]|$)/i.test(new URL(url).pathname);
+}
+
+function isLowValueTemporalPage(
+  title: string,
+  url: string
+): boolean {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname
+      .toLowerCase()
+      .replace(/\/+$/, "");
+
+    // A domain homepage is not an individual news article.
+    if (!path || path === "/index" || path === "/home") {
+      return true;
+    }
+
+    const segments = path.split("/").filter(Boolean);
+
+    // Common non-editorial destinations: directories, service pages,
+    // learning hubs, books, and category/archive pages.
+    const nonArticleSegments = new Set([
+      "services", "service", "solutions", "consulting",
+      "directory", "directories", "category", "categories",
+      "tag", "tags", "topics", "books", "book",
+      "tutorials", "tutorial", "docs", "documentation",
+      "learn", "learning", "academy", "courses", "course",
+      "webcasts", "webcast", "codelabs", "codelab"
+    ]);
+
+    if (segments.some(segment => nonArticleSegments.has(segment))) {
+      return true;
+    }
+
+    const titleLooksLikeLandingPage =
+      /\b(homepage|our services|services we offer|what we do|solutions for|directory of|browse (?:our )?(?:resources|courses|tools)|learn (?:about|how to))\b/i.test(title);
+
+    return titleLooksLikeLandingPage;
+  } catch {
+    return true;
+  }
 }
 
 function isDevelopmentSignal(text: string): boolean {
@@ -724,8 +899,8 @@ function classifyTemporalSource(
 ): ClassifiedSource {
   const combinedText = `${source.title}. ${source.snippet}`;
 
-  // Prefer the search provider's dedicated date field. Fall back
-  // to a relative age embedded in the snippet when it is absent.
+  // Prefer the provider's publication-age field; use snippet age only
+  // when provider metadata is absent or cannot be parsed.
   const providerAge = source.date
     ? extractRelativeAgeMinutes(source.date)
     : null;
@@ -743,7 +918,6 @@ function classifyTemporalSource(
 
   const explicitDate = extractExplicitDate(combinedText);
   const futureLanguage = hasFutureEventLanguage(combinedText);
-
   const isFutureEvent =
     futureLanguage &&
     explicitDate !== null &&
@@ -756,7 +930,8 @@ function classifyTemporalSource(
     ageMinutes <= constraint.recencyMinutes;
 
   const isEvergreen = isEvergreenContent(source.title);
-  const isRoundup = isRoundupContent(source.title);
+  const isRoundup = isRoundupContent(source.title, source.url);
+  const isLowValuePage = isLowValueTemporalPage(source.title, source.url);
   const isDevelopment = isDevelopmentSignal(combinedText);
 
   const eligibleDevelopment =
@@ -764,18 +939,21 @@ function classifyTemporalSource(
     !isFutureEvent &&
     !isEvergreen &&
     !isRoundup &&
+    !isLowValuePage &&
     isDevelopment;
 
   let reason = "No usable publication-age evidence was found.";
 
   if (isFutureEvent) {
     reason = "Describes a future event, not a completed development.";
+  } else if (isRoundup) {
+    reason = "Periodic roundup or digest; not an individual announcement.";
+  } else if (isLowValuePage) {
+    reason = "Homepage, service page, directory, or learning/resource landing page.";
+  } else if (isEvergreen) {
+    reason = "Evergreen list, guide, documentation, or reference content.";
   } else if (ageMinutes !== null && !isRecent) {
     reason = "Publication age is outside the requested time window.";
-  } else if (isRoundup) {
-    reason = "Weekly, daily, or periodic roundup; not an individual announcement.";
-  } else if (isEvergreen) {
-    reason = "Looks like evergreen list, guide, documentation, or reference content.";
   } else if (isRecent && !isDevelopment) {
     reason = "Recent content, but no concrete announcement or release signal was detected.";
   } else if (eligibleDevelopment) {
@@ -792,6 +970,7 @@ function classifyTemporalSource(
     isFutureEvent,
     isEvergreen,
     isRoundup,
+    isLowValuePage,
     isDevelopmentSignal: isDevelopment,
     eligibleDevelopment,
     reason
@@ -808,7 +987,8 @@ function classifySources(
 }
 
 function getTemporalEvidence(
-  classified: ClassifiedSource[]
+  classified: ClassifiedSource[],
+  duplicateCoverageRemoved = 0
 ): TemporalEvidence {
   return {
     recentProviderDateMatches: classified.filter(
@@ -831,7 +1011,11 @@ function getTemporalEvidence(
     ).length,
     excludedRoundups: classified.filter(
       item => item.isRoundup
-    ).length
+    ).length,
+    excludedLowValuePages: classified.filter(
+      item => item.isLowValuePage
+    ).length,
+    duplicateCoverageRemoved
   };
 }
 
@@ -841,7 +1025,8 @@ function getTemporalEvidence(
 
 function buildTemporalAnswer(
   classified: ClassifiedSource[],
-  constraint: TemporalConstraint
+  constraint: TemporalConstraint,
+  duplicateCoverageRemoved: number
 ): string {
   const eligible = classified.filter(
     item => item.eligibleDevelopment
@@ -853,6 +1038,7 @@ function buildTemporalAnswer(
       !item.isFutureEvent &&
       !item.isEvergreen &&
       !item.isRoundup &&
+      !item.isLowValuePage &&
       !item.isDevelopmentSignal
   );
 
@@ -921,6 +1107,10 @@ function buildTemporalAnswer(
     item => item.isRoundup
   ).length;
 
+  const lowValueCount = classified.filter(
+    item => item.isLowValuePage
+  ).length;
+
   const unverifiedCount = classified.filter(
     item => item.ageMinutes === null
   ).length;
@@ -933,6 +1123,8 @@ function buildTemporalAnswer(
     `- Future events excluded: ${futureCount}`,
     `- Evergreen list/reference pages excluded: ${evergreenCount}`,
     `- Periodic roundups excluded: ${roundupCount}`,
+    `- Homepage/service/directory/resource pages excluded: ${lowValueCount}`,
+    `- Duplicate coverage items removed: ${duplicateCoverageRemoved}`,
     "",
     "This answer is generated from backend-validated search evidence, not an unrestricted LLM summary."
   );
@@ -1311,6 +1503,7 @@ export async function runAgent(
 
   let answer = "";
   let temporalEvidence: TemporalEvidence | undefined;
+  let responseSources = extractValidSources(sources);
 
   if (isTemporalRequest) {
     // If the model skipped web search, force one backend
@@ -1328,20 +1521,26 @@ export async function runAgent(
       }
     }
 
-    const uniqueSources = extractValidSources(sources);
+    const uniqueSources = responseSources;
 
     const classified = classifySources(
       uniqueSources,
       temporalConstraint
     );
+    const deduplicated = deduplicateTemporalEvents(classified);
+    responseSources = deduplicated.items.map(item => item.source);
 
-    temporalEvidence = getTemporalEvidence(classified);
+    temporalEvidence = getTemporalEvidence(
+      deduplicated.items,
+      deduplicated.removed
+    );
 
     // No LLM-generated temporal synthesis:
     // the backend controls which sources enter the answer.
     answer = buildTemporalAnswer(
-      classified,
-      temporalConstraint
+      deduplicated.items,
+      temporalConstraint,
+      deduplicated.removed
     );
   }
 
@@ -1449,7 +1648,7 @@ Do not request additional searches.
     conversationId,
     answer,
     model: process.env.LLM_MODEL ?? "openai/gpt-oss-20b",
-    sources: extractValidSources(sources),
+    sources: responseSources,
     toolCalls: searchCalls,
     ...(temporalEvidence ? { temporalEvidence } : {}),
     usage: {
